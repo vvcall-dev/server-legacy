@@ -10,6 +10,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -42,7 +43,6 @@ struct ConfigUpdateRequest {
 struct ServerState {
     rooms: Mutex<HashMap<String, broadcast::Sender<String>>>,
     db: Mutex<Connection>,
-    relay_rooms: Mutex<HashMap<String, HashMap<SocketAddr, Instant>>>,
 }
 
 type AppState = Arc<ServerState>;
@@ -67,10 +67,9 @@ async fn main() {
     let state = Arc::new(ServerState {
         rooms: Mutex::new(HashMap::new()),
         db: Mutex::new(db_conn),
-        relay_rooms: Mutex::new(HashMap::new()),
     });
 
-    start_udp_relay(state.clone());
+    start_udp_relay();
 
     let app = Router::new()
         .route("/ws/:room", get(ws_handler))
@@ -85,53 +84,94 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-fn start_udp_relay(state: AppState) {
-    let state_relay = state.clone();
+struct FastRelay {
+    rooms: RwLock<HashMap<String, HashMap<SocketAddr, Instant>>>,
+    peer_to_room: RwLock<HashMap<SocketAddr, String>>,
+}
+
+fn start_udp_relay() {
+    let relay = Arc::new(FastRelay {
+        rooms: RwLock::new(HashMap::new()),
+        peer_to_room: RwLock::new(HashMap::new()),
+    });
+
+    let relay_net = relay.clone();
     tokio::spawn(async move {
         let socket = UdpSocket::bind("0.0.0.0:3031")
             .await
             .expect("Не удалось занять порт 3031 для UDP");
-        println!("Ретранслятор запущен на UDP порту 3031");
+        println!("SFU Ретранслятор запущен на UDP порту 3031 (Zero-allocation mode)");
 
-        let mut buf = [0u8; 2048];
+        let mut buf = [0u8; 1500];
+
         loop {
-            if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
-                if len <= 64 {
-                    continue;
+            let (len, addr) = match socket.recv_from(&mut buf).await {
+                Ok(res) => res,
+                Err(_) => continue,
+            };
+
+            if len == 65 && buf[0] == 0xFF {
+                let room_hash = match std::str::from_utf8(&buf[1..65]) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => continue,
+                };
+
+                let mut rooms = relay_net.rooms.write().unwrap();
+                let mut peer_to_room = relay_net.peer_to_room.write().unwrap();
+
+                rooms
+                    .entry(room_hash.clone())
+                    .or_default()
+                    .insert(addr, Instant::now());
+                peer_to_room.insert(addr, room_hash);
+                continue;
+            }
+
+            let room_hash = {
+                let p2r = relay_net.peer_to_room.read().unwrap();
+                match p2r.get(&addr) {
+                    Some(r) => r.clone(),
+                    None => continue,
                 }
+            };
 
-                let room_hash = String::from_utf8_lossy(&buf[..64]).to_string();
-
-                let mut relay_map = state_relay.relay_rooms.lock().await;
-                let room_peers = relay_map.entry(room_hash).or_insert_with(HashMap::new);
-
-                room_peers.insert(addr, Instant::now());
-
-                let peers_to_send: Vec<SocketAddr> = room_peers
-                    .keys()
-                    .filter(|&&peer_addr| peer_addr != addr)
-                    .copied()
-                    .collect();
-
-                drop(relay_map);
-
-                for peer in peers_to_send {
-                    let _ = socket.send_to(&buf[..len], peer).await;
+            let targets: Vec<SocketAddr> = {
+                let rooms = relay_net.rooms.read().unwrap();
+                if let Some(peers) = rooms.get(&room_hash) {
+                    peers
+                        .keys()
+                        .filter(|&&peer_addr| peer_addr != addr)
+                        .copied()
+                        .collect()
+                } else {
+                    Vec::new()
                 }
+            };
+
+            for target in targets {
+                let _ = socket.send_to(&buf[..len], target).await;
             }
         }
     });
 
+    let relay_cleaner = relay.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            let mut relay_map = state.relay_rooms.lock().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
             let now = Instant::now();
+            let mut rooms = relay_cleaner.rooms.write().unwrap();
+            let mut p2r = relay_cleaner.peer_to_room.write().unwrap();
 
-            for peers in relay_map.values_mut() {
-                peers.retain(|_, last_seen| now.duration_since(*last_seen).as_secs() < 15);
-            }
-            relay_map.retain(|_, peers| !peers.is_empty());
+            rooms.retain(|_, peers| {
+                peers.retain(|addr, last_seen| {
+                    let active = now.duration_since(*last_seen).as_secs() < 10;
+                    if !active {
+                        p2r.remove(addr);
+                    }
+                    active
+                });
+                !peers.is_empty()
+            });
         }
     });
 }
